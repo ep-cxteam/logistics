@@ -1,0 +1,196 @@
+# Safety checks
+#
+# Runs on every change to main. It looks for things that should never be on
+# a public site: data files, email addresses, phone numbers, links to private
+# documents, outside scripts and trackers, warning words copied from internal
+# documents, pages missing the noindex tag, and very large files.
+#
+# It also checks that every commit message contains the word "checked", which
+# is your promise that you went through the checklist in README.md.
+#
+# A red X in the Actions tab (and an email, if you turned those on) means the
+# check found something. The page is already live, so fix it straight away:
+# open the run, read the list, fix or delete the file, commit again.
+#
+# To allow a shared team inbox or phone number on a page, add it to the
+# ALLOWED_EMAILS or ALLOWED_PHONES list below. Never add a person's own
+# email or number.
+
+name: Safety checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every file
+        env:
+          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, html
+          from pathlib import Path
+
+          # ---- Settings you may edit ------------------------------------
+          ALLOWED_EMAILS = []   # shared team inboxes only, for example "team@example.com"
+          ALLOWED_PHONES = []   # shared team numbers only, written exactly as on the page
+          ALLOWED_HOSTS = [     # outside sites a page may load files from
+              "fonts.googleapis.com",
+              "fonts.gstatic.com",
+              "assets.experiencepoint.com",
+          ]
+          MAX_MB = 10
+          # ---------------------------------------------------------------
+
+          BLOCKED_TYPES = {
+              ".csv": "a spreadsheet", ".tsv": "a spreadsheet", ".xls": "a spreadsheet",
+              ".xlsx": "a spreadsheet", ".xlsm": "a spreadsheet", ".ods": "a spreadsheet",
+              ".numbers": "a spreadsheet", ".doc": "a document", ".docx": "a document",
+              ".odt": "a document", ".pages": "a document", ".rtf": "a document",
+              ".ppt": "a slide deck", ".pptx": "a slide deck", ".key": "a slide deck",
+              ".pdf": "a PDF (link to the copy on EP's asset site instead)",
+              ".zip": "an archive", ".7z": "an archive", ".rar": "an archive",
+              ".eml": "an email", ".msg": "an email", ".vcf": "a contact card",
+              ".json": "a data file", ".xml": "a data file", ".sql": "a database file",
+              ".db": "a database file", ".sqlite": "a database file",
+              ".env": "a settings file that may hold secrets", ".pem": "a key file",
+              ".key.pem": "a key file", ".mp4": "a video", ".mov": "a video",
+          }
+          TEXT_TYPES = {".html", ".htm", ".css", ".js", ".svg", ".txt", ".md"}
+          SKIP_CONTENT = {"README.md"}   # the rules page talks about these things on purpose
+
+          WARNING_WORDS = [
+              "confidential", "internal only", "internal use only", "for internal use",
+              "do not share", "do not distribute", "not for distribution",
+              "privileged", "proprietary and confidential",
+          ]
+          PRIVATE_LINKS = [
+              ("docs.google.com", "a Google Doc, Sheet, Slide or Form"),
+              ("drive.google.com", "a Google Drive file"),
+              ("sheets.google.com", "a Google Sheet"),
+              ("forms.gle", "a Google Form"),
+              ("sharepoint.com", "a SharePoint file"),
+              ("onedrive.live.com", "a OneDrive file"),
+              ("1drv.ms", "a OneDrive file"),
+              ("dropbox.com", "a Dropbox file"),
+              ("box.com/s/", "a Box file"),
+              ("salesforce.com", "Salesforce"),
+              ("hubspot.com", "HubSpot"),
+          ]
+          TRACKERS = ["clarity.ms", "googletagmanager", "google-analytics", "gtag(",
+                      "hotjar", "segment.com", "fbq(", "connect.facebook.net", "mixpanel"]
+
+          EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+          PHONE_RE = re.compile(
+              r"(?<![\w#.-])(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)|\d{2,4})[\s.-]\d{3,4}[\s.-]\d{3,4}(?!\w|[.-]\d)")
+          TAG_RE = re.compile(r"<(script|iframe|frame|embed|object|img|video|audio|source|track|link)\b([^>]*)>", re.I)
+          ATTR_RE = re.compile(r"\b(?:src|href|data|poster)\s*=\s*[\"']([^\"']+)[\"']", re.I)
+          NOINDEX_RE = re.compile(
+              r"<meta[^>]+name\s*=\s*[\"']robots[\"'][^>]+content\s*=\s*[\"'][^\"']*noindex", re.I)
+
+          problems = []
+          def flag(path, msg):
+              problems.append(f"{path}: {msg}")
+
+          def visible_text(page):
+              page = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", page)
+              page = re.sub(r"(?s)<[^>]+>", " ", page)
+              return html.unescape(page)
+
+          def host_of(url):
+              m = re.match(r"(?i)^(?:https?:)?//([^/:?#]+)", url.strip())
+              return m.group(1).lower() if m else None
+
+          root = Path(".")
+          for path in sorted(root.rglob("*")):
+              if not path.is_file() or ".git" in path.parts:
+                  continue
+              rel = path.as_posix()
+              if rel.startswith(".github/"):
+                  continue
+              name = path.name.lower()
+              ext = "".join(path.suffixes[-2:]).lower() if name.endswith(".key.pem") else path.suffix.lower()
+
+              if ext in BLOCKED_TYPES:
+                  flag(rel, f"this is {BLOCKED_TYPES[ext]}. These files can carry names and other private details. Delete it from the repo.")
+                  continue
+              size_mb = path.stat().st_size / 1_000_000
+              if size_mb > MAX_MB:
+                  flag(rel, f"this file is {size_mb:.0f} MB. Keep files under {MAX_MB} MB.")
+              if rel != "README.md" and (" " in rel or rel != rel.lower()):
+                  flag(rel, "use lowercase folder and file names with hyphens, no spaces, so addresses are easy to type.")
+              if ext not in TEXT_TYPES or path.name in SKIP_CONTENT:
+                  continue
+
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lower = text.lower()
+
+              if ext in {".html", ".htm"} and not NOINDEX_RE.search(text):
+                  flag(rel, 'missing <meta name="robots" content="noindex, nofollow"> inside <head>. Add it so search engines leave the page out.')
+
+              for email in sorted(set(EMAIL_RE.findall(text))):
+                  if email.lower() in [e.lower() for e in ALLOWED_EMAILS]:
+                      continue
+                  if re.search(r"@\d+x\.(png|jpg|jpeg|webp)$", email, re.I):
+                      continue
+                  flag(rel, f"email address found ({email}). Remove it, or ask the repo owner to allow it if it is a shared team inbox.")
+
+              plain = visible_text(text) if ext in {".html", ".htm", ".svg"} else text
+              for phone in sorted(set(m.group(0).strip() for m in PHONE_RE.finditer(plain))):
+                  digits = re.sub(r"\D", "", phone)
+                  if len(digits) < 10 or phone in ALLOWED_PHONES:
+                      continue
+                  flag(rel, f"phone number found ({phone}). Remove it, or ask the repo owner to allow it if it is a shared team number.")
+
+              for word in WARNING_WORDS:
+                  if re.search(r"\b" + re.escape(word) + r"\b", lower):
+                      flag(rel, f'contains "{word}". Text marked this way should not be on a public page.')
+
+              for needle, what in PRIVATE_LINKS:
+                  if needle in lower:
+                      flag(rel, f"links to {what}. Public pages should not point to private files. Remove the link, or ask the repo owner.")
+
+              for t in TRACKERS:
+                  if t in lower:
+                      flag(rel, f'contains a tracker or analytics code ("{t}"). Remove it; trackers send what is on screen to another company.')
+
+              if ext in {".html", ".htm", ".svg"}:
+                  for m in TAG_RE.finditer(text):
+                      tag, attrs = m.group(1).lower(), m.group(2)
+                      if tag == "link" and not re.search(r"\brel\s*=\s*[\"'][^\"']*(stylesheet|preload|modulepreload|icon)", attrs, re.I):
+                          continue
+                      for url in ATTR_RE.findall(attrs):
+                          host = host_of(url)
+                          if host and host not in ALLOWED_HOSTS:
+                              flag(rel, f"loads a file from outside the site ({host}). Copy the file into the repo or ask the repo owner.")
+
+          # Commit messages: the word "checked" is the promise that the checklist was done.
+          if os.environ.get("EVENT_NAME") == "push":
+              try:
+                  commits = json.loads(os.environ.get("COMMITS_JSON") or "[]") or []
+              except json.JSONDecodeError:
+                  commits = []
+              for c in commits:
+                  msg = (c.get("message") or "").strip()
+                  if "checked" not in msg.lower():
+                      first = msg.splitlines()[0] if msg else "(empty)"
+                      problems.append(f'commit "{first}": the message must include the word "checked", your promise that you went through the checklist in README.md. No need to redo it; just use the word next time.')
+
+          if problems:
+              print("The safety check found something. Fix each item below, then commit again.\n")
+              for p in problems:
+                  print(" - " + p)
+              print(f"\n{len(problems)} item(s) to fix. If you are unsure about any of them, ask before you change anything else.")
+              sys.exit(1)
+          print("All clear. Nothing sensitive found.")
+          PY
